@@ -31,9 +31,16 @@ public class RobotPlayer {
      */
     static final Random rng = new Random(6147);
 
-    static MapLocation towerLocation = null;
-    static MapLocation mopperPost = null;
-    static boolean returningToPost = false;
+    static int builderState = 0; // Control builder job (0 = searching, 1 = traveling, 2 = building)
+    static boolean waitingForOrders = false; // Flag to track if builder is idle waiting for tower message
+    static int storedRuinMsg = -1; // Stores the last ruin location message received from soldiers/moppers, encoded as x*100 + y
+    static MapLocation targetRuinLocation = null; // Stores the MapLocation of the ruin it's currently assigned to build
+    static boolean isBuilder = false; // True = this soldier is the dedicated builder, False = this soldier is a painter
+    static boolean patternMarked = false; // Used by builder to track if it already called markTowerPattern()
+    static int ruinsFound = 0; // Used to decide tower type: every 3rd ruin (ruinsFound % 3 == 2) builds money tower
+    static MapLocation towerLocation = null; // Stores the MapLocation of the home paint tower
+    static Direction exploreDir = null; // Remembers current exploration direction
+
     /** Array containing all the possible movement directions. */
     static final Direction[] directions = {
         Direction.NORTH,
@@ -111,12 +118,32 @@ public class RobotPlayer {
      * This code is wrapped inside the infinite loop in run(), so it is called once per turn.
      */
     public static void runTower(RobotController rc) throws GameActionException {
-    // Only paint tower spawns robots
-    if (rc.getType() == UnitType.LEVEL_ONE_MONEY_TOWER ||
-        rc.getType() == UnitType.LEVEL_TWO_MONEY_TOWER ||
-        rc.getType() == UnitType.LEVEL_THREE_MONEY_TOWER) {
-        return;
-    }
+        // Only paint tower spawns robots
+        if (rc.getType() == UnitType.LEVEL_ONE_MONEY_TOWER ||
+            rc.getType() == UnitType.LEVEL_TWO_MONEY_TOWER ||
+            rc.getType() == UnitType.LEVEL_THREE_MONEY_TOWER) {
+            return;
+        }
+        // Read incoming ruin reports from soldiers/moppers
+        Message[] incomingMsgs = rc.readMessages(-1);
+        for (Message msg : incomingMsgs) {
+            if (msg.getBytes() > 0) {
+                storedRuinMsg = msg.getBytes();
+            }
+        }
+        // Forward stored ruin location to nearby builder soldier
+        if (storedRuinMsg > 0) {
+            RobotInfo[] nearbyAllies = rc.senseNearbyRobots(-1, rc.getTeam());
+            for (RobotInfo ally : nearbyAllies) {
+                if (ally.getType() == UnitType.SOLDIER &&
+                    rc.getLocation().distanceSquaredTo(ally.getLocation()) <= 20) {
+                    if (rc.canSendMessage(ally.getLocation(), storedRuinMsg)) {
+                        rc.sendMessage(ally.getLocation(), storedRuinMsg);
+                        break;
+                    }
+                }
+            }
+        }
         // Attack nearest enemy if possible
         RobotInfo[] enemies = rc.senseNearbyRobots(-1, rc.getTeam().opponent());
         if (enemies.length > 0) {
@@ -145,11 +172,12 @@ public class RobotPlayer {
                 if (tile.getPaint().isAlly()) paintedTiles++;
             }
         }
-        // Coverage percentage in visible area
         double coverage = totalTiles > 0 ? (double) paintedTiles / totalTiles * 100 : 0;
 
-        // GREEDY SPAWN DECISION 
-        // Spawn mopper only when coverage and soldier count thresholds are met
+        // Stop spawning if paint reserve too low
+        if (rc.getPaint() < 200) return;
+
+        // Greedy spawn decision
         boolean spawnMopper = false;
         if (coverage >= 15 && soldierCount >= 4 && mopperCount < 2) {
             spawnMopper = true;
@@ -161,13 +189,13 @@ public class RobotPlayer {
         for (Direction dir : directions) {
             MapLocation spawnLoc = rc.getLocation().add(dir);
             if (spawnMopper) {
-                if (rc.canBuildRobot(UnitType.MOPPER, spawnLoc)) {
+                if (rc.getPaint() > 200 && rc.canBuildRobot(UnitType.MOPPER, spawnLoc)) {
                     rc.buildRobot(UnitType.MOPPER, spawnLoc);
                     System.out.println("Built a MOPPER");
                     break;
                 }
             } else {
-                if (rc.canBuildRobot(UnitType.SOLDIER, spawnLoc)) {
+                if (rc.getPaint() > 200 && rc.canBuildRobot(UnitType.SOLDIER, spawnLoc)) {
                     rc.buildRobot(UnitType.SOLDIER, spawnLoc);
                     System.out.println("Built a SOLDIER");
                     break;
@@ -176,11 +204,6 @@ public class RobotPlayer {
         }
     }
 
-
-    /**
-     * Run a single turn for a Soldier.
-     * This code is wrapped inside the infinite loop in run(), so it is called once per turn.
-     */
     public static void runSoldier(RobotController rc) throws GameActionException {
         // Save tower location on first turn
         if (towerLocation == null) {
@@ -195,65 +218,122 @@ public class RobotPlayer {
             }
         }
 
-        int maxPaint = rc.getType().paintCapacity;   // 200 for soldier
+        // Decide builder role on first turn only
+        if (turnCount == 1) {
+            RobotInfo[] allies = rc.senseNearbyRobots(-1, rc.getTeam());
+            int lowerIDCount = 0;
+            for (RobotInfo ally : allies) {
+                if (ally.getType() == UnitType.SOLDIER && ally.getID() < rc.getID()) {
+                    lowerIDCount++;
+                }
+            }
+            isBuilder = (lowerIDCount == 1);
+        }
+
+        int maxPaint = rc.getType().paintCapacity;
         int currentPaint = rc.getPaint();
         int paintPercent = currentPaint * 100 / maxPaint;
 
-        // ---- GREEDY DECISION ----
-        if (paintPercent < 40) {
-            // Paint is low → go refill
+        // Greedy Decision
+        reportRuinToTower(rc);
+        if (paintPercent < 60) {
             rc.setIndicatorString("Low paint! Retreating to refill");
             retreatToRefill(rc);
+        } else if (isBuilder) {
+            runBuilder(rc);
         } else {
-            // Paint is fine → go paint nearest unpainted tile
             rc.setIndicatorString("Painting! Paint: " + currentPaint);
             paintNearest(rc, rc.getID());
         }
     }
+    static void runBuilder(RobotController rc) throws GameActionException {
+        // Searching : walk to tower, wait for ruin order
+        if (builderState == 0) {
+            rc.setIndicatorString("Builder: waiting for orders");
 
-    // Soldier retreats to mopper post or tower for refill
+            // Check message from tower with ruin location
+            Message[] messages = rc.readMessages(-1);
+            for (Message msg : messages) {
+                if (msg.getBytes() > 0) {
+                    int x = msg.getBytes() / 100;
+                    int y = msg.getBytes() % 100;
+                    targetRuinLocation = new MapLocation(x, y);
+                    builderState = 1;
+                    waitingForOrders = false;
+                }
+            }
+
+            // Check if ruin already visible
+            if (builderState == 0) {
+                MapInfo[] nearby = rc.senseNearbyMapInfos();
+                for (MapInfo tile : nearby) {
+                    if (tile.hasRuin() && rc.senseRobotAtLocation(tile.getMapLocation()) == null) {
+                        targetRuinLocation = tile.getMapLocation();
+                        builderState = 2;
+                        waitingForOrders = false;
+                        break;
+                    }
+                }
+            }
+
+            // Walk back to tower while waiting
+            if (builderState == 0 && towerLocation != null &&
+                rc.getLocation().distanceSquaredTo(towerLocation) > 4) {
+                moveToward(rc, towerLocation);
+            }
+            return;
+        }
+
+        // Traveling : walk toward known ruin
+        if (builderState == 1) {
+            rc.setIndicatorString("Builder: traveling to ruin");
+            if (targetRuinLocation == null) { builderState = 0; return; }
+
+            // Check if ruin already has tower
+            MapInfo[] nearby = rc.senseNearbyMapInfos();
+            for (MapInfo tile : nearby) {
+                if (tile.hasRuin() && tile.getMapLocation().equals(targetRuinLocation)) {
+                    if (rc.senseRobotAtLocation(tile.getMapLocation()) != null) {
+                        targetRuinLocation = null;
+                        builderState = 0;
+                        return;
+                    }
+                    builderState = 2;
+                    break;
+                }
+            }
+            moveToward(rc, targetRuinLocation);
+            return;
+        }
+
+        // Building : paint and complete tower
+        if (builderState == 2) {
+            rc.setIndicatorString("Builder: building tower!");
+            boolean stillBuilding = findAndBuildTower(rc);
+            if (!stillBuilding) {
+                targetRuinLocation = null;
+                patternMarked = false;
+                builderState = 0;
+                waitingForOrders = true;
+            }
+        }
+    }
+    // Soldier retreats to tower for refill
     static void retreatToRefill(RobotController rc) throws GameActionException {
         int maxPaint = rc.getType().paintCapacity;
         int currentPaint = rc.getPaint();
 
-        if (towerLocation != null && 
-            rc.getLocation().distanceSquaredTo(towerLocation) <= 2) {
-            int needed = rc.getType().paintCapacity - rc.getPaint();
-            if (rc.canTransferPaint(towerLocation, -needed)) {
-                rc.transferPaint(towerLocation, -needed);
-            }
-            return;
-        }
-        // Check if mopper is nearby → wait for transfer
-        RobotInfo[] allies = rc.senseNearbyRobots(2, rc.getTeam());
-        for (RobotInfo ally : allies) {
-            if (ally.getType() == UnitType.MOPPER) {
-                // Mopper is nearby, stay and wait for transfer
-                // Paint under current tile while waiting
-                MapInfo currentTile = rc.senseMapInfo(rc.getLocation());
-                if (!currentTile.getPaint().isAlly() && rc.canAttack(rc.getLocation())) {
-                    rc.attack(rc.getLocation());
-                }
-                return;
-            }
-        }
-
-        // No mopper nearby → go to tower
         if (towerLocation != null) {
-            // If at tower, withdraw paint until FULL (>= 90%)
             if (rc.getLocation().distanceSquaredTo(towerLocation) <= 2) {
                 if (currentPaint < maxPaint * 9 / 10) {
-                    // Withdraw from tower - negative value means withdraw
                     int needed = maxPaint - currentPaint;
                     if (rc.canTransferPaint(towerLocation, -needed)) {
                         rc.transferPaint(towerLocation, -needed);
                         rc.setIndicatorString("Refilling at tower...");
                     }
                 }
-                // Only leave when paint >= 90% FULL
                 return;
             }
-            // Move toward tower
             moveToward(rc, towerLocation);
         }
     }
@@ -279,7 +359,7 @@ public class RobotPlayer {
     MapLocation nearest = null;
     int minDist = Integer.MAX_VALUE;
     for (MapInfo tile : nearbyTiles) {
-        if (!tile.isWall() && !tile.hasRuin() && !tile.getPaint().isAlly()) {
+        if (!tile.isWall() && !tile.hasRuin() && !tile.getPaint().isAlly() && !tile.getPaint().isEnemy()) {
             int dist = target.distanceSquaredTo(tile.getMapLocation());
             if (dist < minDist) {
                 minDist = dist;
@@ -302,8 +382,22 @@ public class RobotPlayer {
                 }
             }
         } else {
-            // All visible tiles painted → explore randomly
-            moveRandom(rc);
+            // No unpainted tile visible do random walk
+            if (exploreDir == null || !rc.canMove(exploreDir)) {
+                // Pick new random direction when no direction set or blocked
+                Direction newDir = directions[rng.nextInt(directions.length)];
+                int attempts = 0;
+                while (!rc.canMove(newDir) && attempts < 8) {
+                    newDir = directions[rng.nextInt(directions.length)];
+                    attempts++;
+                }
+                exploreDir = newDir;
+            }
+            if (rc.isMovementReady() && rc.canMove(exploreDir)) {
+                rc.move(exploreDir);
+            }
+            rc.setIndicatorString("Exploring: " + exploreDir);
+
             // Always paint under feet
             MapInfo currentTile = rc.senseMapInfo(rc.getLocation());
             if (!currentTile.getPaint().isAlly() && rc.canAttack(rc.getLocation())) {
@@ -311,14 +405,86 @@ public class RobotPlayer {
             }
         }
     }
+    // Tower construction process   
+    static boolean findAndBuildTower(RobotController rc) throws GameActionException {
+        // Find nearest ruin
+        MapInfo[] nearbyTiles = rc.senseNearbyMapInfos();
+        MapInfo targetRuin = null;
+        for (MapInfo tile : nearbyTiles) {
+            if (tile.hasRuin() && rc.senseRobotAtLocation(tile.getMapLocation()) == null) {
+                targetRuin = tile;
+                break;
+            }
+        }
+        
+        // No ruin found go paint normally
+        if (targetRuin == null) return false;
+        
+        // Save ruin location
+        MapLocation ruinLoc = targetRuin.getMapLocation();
+        targetRuinLocation = ruinLoc;
+        
+        // Decide tower type
+        RobotInfo[] enemies = rc.senseNearbyRobots(-1, rc.getTeam().opponent());
+        boolean enemyNearby = enemies.length > 0;
+        UnitType towerType;
+        if (enemyNearby) {
+            towerType = UnitType.LEVEL_ONE_DEFENSE_TOWER;
+        } else if (ruinsFound % 3 == 2) {
+            towerType = UnitType.LEVEL_ONE_MONEY_TOWER;
+        } else {
+            towerType = UnitType.LEVEL_ONE_PAINT_TOWER;
+        }
 
+        // Move to ruin
+        if (rc.getLocation().distanceSquaredTo(ruinLoc) > 2) {
+            moveToward(rc, ruinLoc);
+            return true;
+        }
+
+        // Mark pattern if not marked
+        if (!patternMarked && rc.canMarkTowerPattern(towerType, ruinLoc)) {
+            rc.markTowerPattern(towerType, ruinLoc);
+            patternMarked = true;
+            return true;
+        }
+
+        // Paint unpainted/wrong tiles in 5x5 area
+        boolean allPainted = true;
+        for (MapInfo tile : rc.senseNearbyMapInfos(ruinLoc, 8)) {
+            if (tile.getMark() != PaintType.EMPTY && 
+                tile.getMark() != tile.getPaint()) {
+                allPainted = false;
+                if (!rc.canAttack(tile.getMapLocation())) {
+                    moveToward(rc, tile.getMapLocation());
+                    return true;
+                }
+                boolean useSecondary = tile.getMark() == PaintType.ALLY_SECONDARY;
+                if (rc.isActionReady()) {
+                    rc.attack(tile.getMapLocation(), useSecondary);
+                }
+                return true;
+            }
+        }
+
+        // Complete tower
+        if (allPainted && rc.canCompleteTowerPattern(towerType, ruinLoc)) {
+            rc.completeTowerPattern(towerType, ruinLoc);
+            patternMarked = false;
+            ruinsFound++;
+            System.out.println("Built " + towerType + " at " + ruinLoc);
+            return false;
+        }
+
+        return true;
+    }
 
     /**
      * Run a single turn for a Mopper.
      * This code is wrapped inside the infinite loop in run(), so it is called once per turn.
      */
     public static void runMopper(RobotController rc) throws GameActionException {
-        // Save tower location on first turn and calculate fixed post
+        // Save tower location on spawn
         if (towerLocation == null) {
             RobotInfo[] allies = rc.senseNearbyRobots(-1, rc.getTeam());
             for (RobotInfo ally : allies) {
@@ -331,123 +497,144 @@ public class RobotPlayer {
             }
         }
 
-        // Calculate fixed post = 1/4 of map from tower toward center
-        if (mopperPost == null && towerLocation != null) {
-            int mapWidth  = rc.getMapWidth();
-            int mapHeight = rc.getMapHeight();
-            int centerX   = mapWidth  / 2;
-            int centerY   = mapHeight / 2;
-
-            // Move 1/4 of the way from tower to center
-            int postX = towerLocation.x + (centerX - towerLocation.x) / 2;
-            int postY = towerLocation.y + (centerY - towerLocation.y) / 2;
-            postX = Math.max(0, Math.min(mapWidth - 1, postX));
-            postY = Math.max(0, Math.min(mapHeight - 1, postY));
-            mopperPost = new MapLocation(postX, postY);
-            System.out.println("Mopper post set at: " + mopperPost);
-        }
-
-        int maxPaint    = rc.getType().paintCapacity; // 100 for mopper
+        int maxPaint     = rc.getType().paintCapacity;
         int currentPaint = rc.getPaint();
         int paintPercent = currentPaint * 100 / maxPaint;
 
-        // ---- GREEDY DECISION ----
+        // Greedy decision
+        reportRuinToTower(rc);
         if (paintPercent < 30) {
-            // Own paint low → go back to tower to refill
-            rc.setIndicatorString("Mopper low paint! Going to tower");
+            // Own paint low do retreat to tower
+            rc.setIndicatorString("Mopper retreating to refill");
             mopperRefill(rc);
-        } else if (returningToPost) {
-            // Just refilled → return to post first
-            rc.setIndicatorString("Returning to post");
-            if (mopperPost != null) {
-                if (rc.getLocation().equals(mopperPost) ||
-                    rc.getLocation().distanceSquaredTo(mopperPost) <= 2) {
-                    returningToPost = false;
-                } else {
-                    moveToward(rc, mopperPost);
+            return;
+        }
+
+        // Find furthest painter soldier to pair with
+        RobotInfo[] allies = rc.senseNearbyRobots(-1, rc.getTeam());
+        RobotInfo pairedSoldier = null;
+        int maxDist = Integer.MIN_VALUE;
+        for (RobotInfo ally : allies) {
+            if (ally.getType() == UnitType.SOLDIER) {
+                int dist = towerLocation != null ?
+                    towerLocation.distanceSquaredTo(ally.getLocation()) : 0;
+                if (dist > maxDist) {
+                    maxDist = dist;
+                    pairedSoldier = ally;
                 }
             }
-        } else {
-            // At post or going to post → check for low paint soldiers
-            rc.setIndicatorString("Mopper on duty at post");
-            mopperDuty(rc);
         }
-    }
-
-    // Mopper refills at tower then returns to post
-    static void mopperRefill(RobotController rc) throws GameActionException {
-        if (towerLocation == null) {
-            // Tower not found yet → move randomly to search for it
-            moveRandom(rc);
-            // Try to find tower while exploring
-            RobotInfo[] allies = rc.senseNearbyRobots(-1, rc.getTeam());
-            for (RobotInfo ally : allies) {
-                if (ally.getType() == UnitType.LEVEL_ONE_PAINT_TOWER ||
-                    ally.getType() == UnitType.LEVEL_TWO_PAINT_TOWER ||
-                    ally.getType() == UnitType.LEVEL_THREE_PAINT_TOWER) {
-                    towerLocation = ally.getLocation();
+        // Mop nearest enemy paint tile
+        MapInfo[] nearbyTiles = rc.senseNearbyMapInfos();
+        MapLocation enemyPaint = null;
+        int minEnemyDist = Integer.MAX_VALUE;
+        for (MapInfo tile : nearbyTiles) {
+            if (tile.getPaint().isEnemy()) {
+                int dist = rc.getLocation().distanceSquaredTo(tile.getMapLocation());
+                if (dist < minEnemyDist) {
+                    minEnemyDist = dist;
+                    enemyPaint = tile.getMapLocation();
                 }
+            }
+        }
+        if (enemyPaint != null) {
+            rc.setIndicatorString("Mopping enemy paint!");
+            if (rc.isActionReady() && rc.canAttack(enemyPaint)) {
+                rc.attack(enemyPaint);
+            } else {
+                moveToward(rc, enemyPaint);
             }
             return;
         }
 
-        int maxPaint    = rc.getType().paintCapacity;
-        int currentPaint = rc.getPaint();
+        // Transfer paint to paired soldier if low
+        if (pairedSoldier != null) {
+            int soldierPaint   = pairedSoldier.getPaintAmount();
+            int soldierMax     = UnitType.SOLDIER.paintCapacity;
+            int soldierPercent = soldierPaint * 100 / soldierMax;
 
-        if (rc.getLocation().distanceSquaredTo(towerLocation) <= 2) {
-            // At tower → withdraw until FULL (>= 90%)
-            if (currentPaint < maxPaint * 9 / 10) {
-                int needed = maxPaint - currentPaint;
-                if (rc.canTransferPaint(towerLocation, -needed)) {
-                    rc.transferPaint(towerLocation, -needed);
-                    rc.setIndicatorString("Mopper refilling...");
+            if (soldierPercent < 60) {
+                int transferAmount = Math.min(
+                    rc.getPaint() - 30,
+                    soldierMax - soldierPaint
+                );
+                if (transferAmount > 0 &&
+                    rc.canTransferPaint(pairedSoldier.getLocation(), transferAmount)) {
+                    rc.transferPaint(pairedSoldier.getLocation(), transferAmount);
+                    rc.setIndicatorString("Transferred paint to paired soldier!");
+                    return;
                 }
-            } else {
-                // Fully refilled → return to post
-                returningToPost = true;
             }
-        } else {
-            // Walk to tower
-            moveToward(rc, towerLocation);
+
+            // Follow paired soldier
+            rc.setIndicatorString("Following paired soldier");
+            moveToward(rc, pairedSoldier.getLocation());
+            return;
         }
+
+        // No soldier found do persistent random walk to find one
+            rc.setIndicatorString("Searching for soldier to pair");
+            if (exploreDir == null || !rc.canMove(exploreDir)) {
+                Direction newDir = directions[rng.nextInt(directions.length)];
+                int attempts = 0;
+                while (!rc.canMove(newDir) && attempts < 8) {
+                    newDir = directions[rng.nextInt(directions.length)];
+                    attempts++;
+                }
+                exploreDir = newDir;
+            }
+            if (rc.isMovementReady() && rc.canMove(exploreDir)) {
+                rc.move(exploreDir);
+            }
     }
-
-    // Mopper stays at post and transfers paint to low soldiers
-    static void mopperDuty(RobotController rc) throws GameActionException {
-        // First check if any adjacent soldier needs paint
-        RobotInfo[] allies = rc.senseNearbyRobots(2, rc.getTeam());
-        for (RobotInfo ally : allies) {
-            if (ally.getType() == UnitType.SOLDIER) {
-                int soldierMaxPaint = UnitType.SOLDIER.paintCapacity; // 200
-                int soldierPaint    = ally.getPaintAmount();
-                int soldierPercent  = soldierPaint * 100 / soldierMaxPaint;
-
-                if (soldierPercent < 90) {
-                    // Transfer paint to soldier
-                    int transferAmount = Math.min(
-                        rc.getPaint() - 40,          // keep 20 for mopper itself
-                        soldierMaxPaint - soldierPaint // fill soldier up
-                    );
-                    if (transferAmount > 0 &&
-                        rc.canTransferPaint(ally.getLocation(), transferAmount)) {
-                        rc.transferPaint(ally.getLocation(), transferAmount);
-                        rc.setIndicatorString("Transferred paint to soldier!");
-                        return;
+        // Mopper Goes Back to Tower to Refill Paint
+        static void mopperRefill(RobotController rc) throws GameActionException {
+            // Tower location unknown
+            if (towerLocation == null) {
+                moveRandom(rc);
+                RobotInfo[] allies = rc.senseNearbyRobots(-1, rc.getTeam());
+                for (RobotInfo ally : allies) {
+                    if (ally.getType() == UnitType.LEVEL_ONE_PAINT_TOWER ||
+                        ally.getType() == UnitType.LEVEL_TWO_PAINT_TOWER ||
+                        ally.getType() == UnitType.LEVEL_THREE_PAINT_TOWER) {
+                        towerLocation = ally.getLocation();
                     }
                 }
+                return;
             }
-        }
 
-        // No soldiers need help → make sure we're at our post
-        if (mopperPost != null) {
-            if (rc.getLocation().distanceSquaredTo(mopperPost) > 2) {
-                moveToward(rc, mopperPost);
+            int maxPaint     = rc.getType().paintCapacity;
+            int currentPaint = rc.getPaint();
+            // Tower location known, already adjacent
+            if (rc.getLocation().distanceSquaredTo(towerLocation) <= 2) {
+                if (currentPaint < maxPaint * 9 / 10) {
+                    int needed = maxPaint - currentPaint;
+                    if (rc.canTransferPaint(towerLocation, -needed)) {
+                        rc.transferPaint(towerLocation, -needed);
+                    }
+                }
+            // Tower location known, not there yet
+            } else {
+                moveToward(rc, towerLocation);
             }
-            // else → already at post, just wait (do nothing)
         }
-    }
 
     // HELPER
+    static void reportRuinToTower(RobotController rc) throws GameActionException {
+        if (towerLocation == null) return;
+        if (rc.getLocation().distanceSquaredTo(towerLocation) > 20) return;
+
+        MapInfo[] nearby = rc.senseNearbyMapInfos();
+        for (MapInfo tile : nearby) {
+            if (tile.hasRuin() && rc.senseRobotAtLocation(tile.getMapLocation()) == null) {
+                int encoded = tile.getMapLocation().x * 100 + tile.getMapLocation().y;
+                if (rc.canSendMessage(towerLocation, encoded)) {
+                    rc.sendMessage(towerLocation, encoded);
+                }
+                break;
+            }
+        }
+    }
     // Move toward a target location
     static void moveToward(RobotController rc, MapLocation target) throws GameActionException {
         if (!rc.isMovementReady()) return;
