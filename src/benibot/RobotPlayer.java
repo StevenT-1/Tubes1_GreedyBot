@@ -1,13 +1,8 @@
 package benibot;
 
 import battlecode.common.*;
-
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
 import java.util.Random;
-import java.util.Set;
+
 
 
 /**
@@ -40,6 +35,14 @@ public class RobotPlayer {
     static int ruinsFound = 0; // Used to decide tower type: every 3rd ruin (ruinsFound % 3 == 2) builds money tower
     static MapLocation towerLocation = null; // Stores the MapLocation of the home paint tower
     static Direction exploreDir = null; // Remembers current exploration direction
+    static MapLocation enemyTowerLocation = null; // known enemy tower location
+    static int splasherState = 0;                 // Control splasher job (0 = waiting, 1 = traveling, 2 = attacking, 3 = refilling)
+    static Direction wallSlideDir = null; // direction to slide when blocked by wall
+    static MapLocation storedRuinToReport = null;
+    static MapLocation storedEnemyTowerToReport = null;
+    static boolean needsHelp = false;
+    static boolean helpRequested = false;
+    static UnitType chosenTowerType = null;
 
     /** Array containing all the possible movement directions. */
     static final Direction[] directions = {
@@ -85,7 +88,7 @@ public class RobotPlayer {
                 switch (rc.getType()){
                     case SOLDIER: runSoldier(rc); break; 
                     case MOPPER: runMopper(rc); break;
-                    case SPLASHER: break; // Consider upgrading examplefuncsplayer to use splashers!
+                    case SPLASHER: runSplasher(rc); break; // Consider upgrading examplefuncsplayer to use splashers!
                     default: runTower(rc); break;
                     }
                 }
@@ -127,8 +130,15 @@ public class RobotPlayer {
         // Read incoming ruin reports from soldiers/moppers
         Message[] incomingMsgs = rc.readMessages(-1);
         for (Message msg : incomingMsgs) {
-            if (msg.getBytes() > 0) {
-                storedRuinMsg = msg.getBytes();
+            int data = msg.getBytes();
+            if (data == -99999) {
+                helpRequested = true;
+            } else if (data > 0) {
+                storedRuinMsg = data;
+            } else if (data < 0) {
+                int x = (-data) / 100;
+                int y = (-data) % 100;
+                enemyTowerLocation = new MapLocation(x, y);
             }
         }
         // Forward stored ruin location to nearby builder soldier
@@ -139,6 +149,7 @@ public class RobotPlayer {
                     rc.getLocation().distanceSquaredTo(ally.getLocation()) <= 20) {
                     if (rc.canSendMessage(ally.getLocation(), storedRuinMsg)) {
                         rc.sendMessage(ally.getLocation(), storedRuinMsg);
+                        storedRuinMsg = -1;
                         break;
                     }
                 }
@@ -152,14 +163,23 @@ public class RobotPlayer {
                 rc.attack(enemyLoc);
             }
         }
+        
+        // Upgrade tower if enough chips
+        if (rc.getChips() > 6000 && rc.canUpgradeTower(rc.getLocation())) {
+            rc.upgradeTower(rc.getLocation());
+        } else if (rc.getChips() > 3500 && rc.canUpgradeTower(rc.getLocation())) {
+            rc.upgradeTower(rc.getLocation());
+        }
 
-        // Count ally soldiers and moppers
+        // Count ally soldiers, moppers and splashers
         int soldierCount = 0;
         int mopperCount = 0;
+        int splasherCount = 0;
         RobotInfo[] allies = rc.senseNearbyRobots(-1, rc.getTeam());
         for (RobotInfo ally : allies) {
             if (ally.getType() == UnitType.SOLDIER) soldierCount++;
             if (ally.getType() == UnitType.MOPPER)  mopperCount++;
+            if (ally.getType() == UnitType.SPLASHER) splasherCount++;
         }
 
         // Calculate paint coverage around tower area
@@ -179,16 +199,34 @@ public class RobotPlayer {
 
         // Greedy spawn decision
         boolean spawnMopper = false;
-        if (coverage >= 15 && soldierCount >= 4 && mopperCount < 2) {
+        boolean spawnSplasher = false;
+        if (helpRequested && splasherCount < 1) {
+            spawnSplasher = true;
+            helpRequested = false;
+        } else if (enemyTowerLocation != null && splasherCount < 1) {
+            spawnSplasher = true;
+        } else if (coverage >= 15 && soldierCount >= 4 && mopperCount < 2) {
             spawnMopper = true;
         } else if (coverage >= 5 && soldierCount >= 2 && mopperCount < 1) {
             spawnMopper = true;
         }
-
         // Try to spawn in each direction
         for (Direction dir : directions) {
             MapLocation spawnLoc = rc.getLocation().add(dir);
-            if (spawnMopper) {
+            if (spawnSplasher) {
+                if (rc.getPaint() > 200 && rc.canBuildRobot(UnitType.SPLASHER, spawnLoc)) {
+                    rc.buildRobot(UnitType.SPLASHER, spawnLoc);
+                    // Only send enemy tower location if we know it
+                    if (enemyTowerLocation != null) {
+                        int encoded = -(enemyTowerLocation.x * 100 + enemyTowerLocation.y);
+                        if (rc.canSendMessage(spawnLoc, encoded)) {
+                            rc.sendMessage(spawnLoc, encoded);
+                        }
+                    }
+                    System.out.println("Built a SPLASHER");
+                    break;
+                }
+            } else if (spawnMopper) {
                 if (rc.getPaint() > 200 && rc.canBuildRobot(UnitType.MOPPER, spawnLoc)) {
                     rc.buildRobot(UnitType.MOPPER, spawnLoc);
                     System.out.println("Built a MOPPER");
@@ -236,6 +274,7 @@ public class RobotPlayer {
 
         // Greedy Decision
         reportRuinToTower(rc);
+        reportEnemyTowerToTower(rc);
         if (paintPercent < 60) {
             rc.setIndicatorString("Low paint! Retreating to refill");
             retreatToRefill(rc);
@@ -247,6 +286,9 @@ public class RobotPlayer {
         }
     }
     static void runBuilder(RobotController rc) throws GameActionException {
+        reportRuinToTower(rc);
+        reportEnemyTowerToTower(rc);
+
         // Searching : walk to tower, wait for ruin order
         if (builderState == 0) {
             rc.setIndicatorString("Builder: waiting for orders");
@@ -280,6 +322,9 @@ public class RobotPlayer {
             if (builderState == 0 && towerLocation != null &&
                 rc.getLocation().distanceSquaredTo(towerLocation) > 4) {
                 moveToward(rc, towerLocation);
+            } else {
+                // Already near tower do paint nearby tiles while waiting
+                paintNearest(rc, rc.getID());
             }
             return;
         }
@@ -309,11 +354,16 @@ public class RobotPlayer {
         // Building : paint and complete tower
         if (builderState == 2) {
             rc.setIndicatorString("Builder: building tower!");
+            RobotInfo[] enemies = rc.senseNearbyRobots(-1, rc.getTeam().opponent());
+            if (enemies.length > 0) {
+                needsHelp = true;
+            }
             boolean stillBuilding = findAndBuildTower(rc);
             if (!stillBuilding) {
                 targetRuinLocation = null;
                 patternMarked = false;
                 builderState = 0;
+                chosenTowerType = null;
                 waitingForOrders = true;
             }
         }
@@ -324,6 +374,8 @@ public class RobotPlayer {
         int currentPaint = rc.getPaint();
 
         if (towerLocation != null) {
+            // Report any seen ruin while at tower
+            reportRuinToTower(rc);
             if (rc.getLocation().distanceSquaredTo(towerLocation) <= 2) {
                 if (currentPaint < maxPaint * 9 / 10) {
                     int needed = maxPaint - currentPaint;
@@ -332,9 +384,25 @@ public class RobotPlayer {
                         rc.setIndicatorString("Refilling at tower...");
                     }
                 }
+                // Send help signal if needed
+                if (needsHelp) {
+                    if (rc.canSendMessage(towerLocation, -99999)) {
+                        rc.sendMessage(towerLocation, -99999);
+                        needsHelp = false;
+                        targetRuinLocation = null;
+                        patternMarked = false;
+                        builderState = 0;
+                    }
+                }
                 return;
             }
+            // Paint current tile first to maintain paint connection to tower
+            MapInfo currentTile = rc.senseMapInfo(rc.getLocation());
+            if (!currentTile.getPaint().isAlly() && rc.isActionReady() && rc.canAttack(rc.getLocation())) {
+                rc.attack(rc.getLocation());
+            }
             moveToward(rc, towerLocation);
+
         }
     }
 
@@ -407,33 +475,14 @@ public class RobotPlayer {
     }
     // Tower construction process   
     static boolean findAndBuildTower(RobotController rc) throws GameActionException {
-        // Find nearest ruin
-        MapInfo[] nearbyTiles = rc.senseNearbyMapInfos();
-        MapInfo targetRuin = null;
-        for (MapInfo tile : nearbyTiles) {
-            if (tile.hasRuin() && rc.senseRobotAtLocation(tile.getMapLocation()) == null) {
-                targetRuin = tile;
-                break;
-            }
-        }
-        
-        // No ruin found go paint normally
-        if (targetRuin == null) return false;
-        
-        // Save ruin location
-        MapLocation ruinLoc = targetRuin.getMapLocation();
-        targetRuinLocation = ruinLoc;
-        
-        // Decide tower type
-        RobotInfo[] enemies = rc.senseNearbyRobots(-1, rc.getTeam().opponent());
-        boolean enemyNearby = enemies.length > 0;
-        UnitType towerType;
-        if (enemyNearby) {
-            towerType = UnitType.LEVEL_ONE_DEFENSE_TOWER;
-        } else if (ruinsFound % 3 == 2) {
-            towerType = UnitType.LEVEL_ONE_MONEY_TOWER;
-        } else {
-            towerType = UnitType.LEVEL_ONE_PAINT_TOWER;
+        // Check the ruin location
+        if (targetRuinLocation == null) return false;
+        MapLocation ruinLoc = targetRuinLocation;
+        if (rc.canSenseLocation(ruinLoc) && rc.senseRobotAtLocation(ruinLoc) != null) {
+            targetRuinLocation = null;
+            patternMarked = false;
+            chosenTowerType = null;
+            return false;
         }
 
         // Move to ruin
@@ -441,6 +490,20 @@ public class RobotPlayer {
             moveToward(rc, ruinLoc);
             return true;
         }
+
+        // Decide tower type
+        if (chosenTowerType == null) {
+            RobotInfo[] enemies = rc.senseNearbyRobots(-1, rc.getTeam().opponent());
+            boolean enemyNearby = enemies.length > 0;
+            if (enemyNearby) {
+                chosenTowerType = UnitType.LEVEL_ONE_DEFENSE_TOWER;
+            } else if (rc.getID() % 5 == 0) {
+                chosenTowerType = UnitType.LEVEL_ONE_MONEY_TOWER;
+            } else {
+                chosenTowerType = UnitType.LEVEL_ONE_PAINT_TOWER;
+            }
+        }
+        UnitType towerType = chosenTowerType;
 
         // Mark pattern if not marked
         if (!patternMarked && rc.canMarkTowerPattern(towerType, ruinLoc)) {
@@ -471,12 +534,179 @@ public class RobotPlayer {
         if (allPainted && rc.canCompleteTowerPattern(towerType, ruinLoc)) {
             rc.completeTowerPattern(towerType, ruinLoc);
             patternMarked = false;
+            chosenTowerType = null;
             ruinsFound++;
             System.out.println("Built " + towerType + " at " + ruinLoc);
             return false;
         }
 
         return true;
+    }
+
+    public static void runSplasher(RobotController rc) throws GameActionException {
+        // Save tower location on spawn
+        if (towerLocation == null) {
+            RobotInfo[] allies = rc.senseNearbyRobots(-1, rc.getTeam());
+            for (RobotInfo ally : allies) {
+                if (ally.getType() == UnitType.LEVEL_ONE_PAINT_TOWER ||
+                    ally.getType() == UnitType.LEVEL_TWO_PAINT_TOWER ||
+                    ally.getType() == UnitType.LEVEL_THREE_PAINT_TOWER) {
+                    towerLocation = ally.getLocation();
+                    break;
+                }
+            }
+        }
+
+        int maxPaint     = rc.getType().paintCapacity;
+        int currentPaint = rc.getPaint();
+        int paintPercent = currentPaint * 100 / maxPaint;
+
+        // State 0: Waiting → read message from tower for enemy tower location
+        if (splasherState == 0) {
+            rc.setIndicatorString("Splasher: waiting for target");
+            Message[] messages = rc.readMessages(-1);
+            for (Message msg : messages) {
+                if (msg.getBytes() < 0 && msg.getBytes() != -99999) {
+                    int x = (-msg.getBytes()) / 100;
+                    int y = (-msg.getBytes()) % 100;
+                    enemyTowerLocation = new MapLocation(x, y);
+                    splasherState = 1;
+                    break;
+                }
+            }
+            // Also check if enemy tower directly visible
+            if (splasherState == 0) {
+                RobotInfo[] enemies = rc.senseNearbyRobots(-1, rc.getTeam().opponent());
+                for (RobotInfo enemy : enemies) {
+                    if (enemy.getType().isTowerType()) {
+                        enemyTowerLocation = enemy.getLocation();
+                        splasherState = 1;
+                        break;
+                    }
+                }
+            }
+            // No target found → explore randomly to find enemy territory
+            if (splasherState == 0) {
+                if (exploreDir == null || !rc.canMove(exploreDir)) {
+                    Direction newDir = directions[rng.nextInt(directions.length)];
+                    int attempts = 0;
+                    while (!rc.canMove(newDir) && attempts < 8) {
+                        newDir = directions[rng.nextInt(directions.length)];
+                        attempts++;
+                    }
+                    exploreDir = newDir;
+                }
+                if (rc.isMovementReady() && rc.canMove(exploreDir)) {
+                    rc.move(exploreDir);
+                }
+            }
+            return;
+        }
+
+        // State 3: Refilling → go back to tower
+        if (splasherState == 3) {
+            rc.setIndicatorString("Splasher: refilling");
+            if (towerLocation != null) {
+                if (rc.getLocation().distanceSquaredTo(towerLocation) <= 2) {
+                    if (currentPaint < maxPaint * 9 / 10) {
+                        int needed = maxPaint - currentPaint;
+                        if (rc.canTransferPaint(towerLocation, -needed)) {
+                            rc.transferPaint(towerLocation, -needed);
+                        }
+                    } else {
+                        splasherState = 1; // refilled → back to attacking
+                    }
+                } else {
+                    moveToward(rc, towerLocation);
+                }
+            }
+            return;
+        }
+
+        // Check paint → retreat if low
+        if (paintPercent < 30) {
+            splasherState = 3;
+            rc.setIndicatorString("Splasher: low paint retreating");
+            return;
+        }
+
+        // State 1: Traveling → move toward enemy tower
+        if (splasherState == 1) {
+            rc.setIndicatorString("Splasher: traveling to enemy tower");
+            if (enemyTowerLocation == null) {
+                splasherState = 0;
+                return;
+            }
+            // Check if enemy tower still exists
+            if (rc.getLocation().distanceSquaredTo(enemyTowerLocation) <= 20) {
+                RobotInfo enemyTower = rc.senseRobotAtLocation(enemyTowerLocation);
+                if (enemyTower == null) {
+                    // Tower destroyed → switch to attacking nearby enemy ruins
+                    splasherState = 2;
+                    enemyTowerLocation = null;
+                } else {
+                    splasherState = 2; // close enough → start attacking
+                }
+            }
+            moveToward(rc, enemyTowerLocation);
+            return;
+        }
+
+        // State 2: Attacking → splash enemy tower area or nearby enemy ruins
+        if (splasherState == 2) {
+            if (enemyTowerLocation != null) {
+                // Enemy tower still target → splash around it
+                rc.setIndicatorString("Splasher: attacking enemy tower!");
+                RobotInfo enemyTower = rc.senseRobotAtLocation(enemyTowerLocation);
+                if (enemyTower == null) {
+                    // Tower destroyed → find nearby enemy ruins to splash
+                    enemyTowerLocation = null;
+                } else {
+                    if (rc.isActionReady() && rc.canAttack(enemyTowerLocation)) {
+                        rc.attack(enemyTowerLocation);
+                    } else {
+                        moveToward(rc, enemyTowerLocation);
+                    }
+                    return;
+                }
+            }
+
+            // No enemy tower → splash nearest enemy painted tile
+            rc.setIndicatorString("Splasher: splashing enemy territory!");
+            MapInfo[] nearbyTiles = rc.senseNearbyMapInfos();
+            MapLocation enemyTile = null;
+            int minDist = Integer.MAX_VALUE;
+            for (MapInfo tile : nearbyTiles) {
+                if (tile.getPaint().isEnemy()) {
+                    int dist = rc.getLocation().distanceSquaredTo(tile.getMapLocation());
+                    if (dist < minDist) {
+                        minDist = dist;
+                        enemyTile = tile.getMapLocation();
+                    }
+                }
+            }
+            if (enemyTile != null) {
+                if (rc.isActionReady() && rc.canAttack(enemyTile)) {
+                    rc.attack(enemyTile);
+                } else {
+                    moveToward(rc, enemyTile);
+                }
+            } else {
+                // No enemy paint visible → explore randomly
+                if (exploreDir == null || !rc.canMove(exploreDir)) {
+                    Direction newDir = directions[rng.nextInt(directions.length)];
+                    int attempts = 0;
+                    while (!rc.canMove(newDir) && attempts < 8) {
+                        newDir = directions[rng.nextInt(directions.length)];
+                        attempts++;
+                    }
+                    exploreDir = newDir;
+                }
+                if (rc.isMovementReady() && rc.canMove(exploreDir)) {
+                    rc.move(exploreDir);
+                }
+            }
+        }
     }
 
     /**
@@ -503,6 +733,7 @@ public class RobotPlayer {
 
         // Greedy decision
         reportRuinToTower(rc);
+        reportEnemyTowerToTower(rc);
         if (paintPercent < 30) {
             // Own paint low do retreat to tower
             rc.setIndicatorString("Mopper retreating to refill");
@@ -622,16 +853,23 @@ public class RobotPlayer {
     // HELPER
     static void reportRuinToTower(RobotController rc) throws GameActionException {
         if (towerLocation == null) return;
-        if (rc.getLocation().distanceSquaredTo(towerLocation) > 20) return;
 
+        // Save ruin location whenever visible, regardless of distance to tower
         MapInfo[] nearby = rc.senseNearbyMapInfos();
         for (MapInfo tile : nearby) {
             if (tile.hasRuin() && rc.senseRobotAtLocation(tile.getMapLocation()) == null) {
-                int encoded = tile.getMapLocation().x * 100 + tile.getMapLocation().y;
-                if (rc.canSendMessage(towerLocation, encoded)) {
-                    rc.sendMessage(towerLocation, encoded);
-                }
+                storedRuinToReport = tile.getMapLocation();
                 break;
+            }
+        }
+
+        // Send stored ruin location only when near tower
+        if (storedRuinToReport != null &&
+            rc.getLocation().distanceSquaredTo(towerLocation) <= 20) {
+            int encoded = storedRuinToReport.x * 100 + storedRuinToReport.y;
+            if (rc.canSendMessage(towerLocation, encoded)) {
+                rc.sendMessage(towerLocation, encoded);
+                storedRuinToReport = null;
             }
         }
     }
@@ -639,24 +877,38 @@ public class RobotPlayer {
     static void moveToward(RobotController rc, MapLocation target) throws GameActionException {
         if (!rc.isMovementReady()) return;
         Direction dir = rc.getLocation().directionTo(target);
+
+        // If direct direction is clear → reset wall slide and move
         if (rc.canMove(dir)) {
+            wallSlideDir = null;
             rc.move(dir);
-        } else {
-            // Try rotated directions if blocked
-            Direction left  = dir.rotateLeft();
-            Direction right = dir.rotateRight();
-            if (rc.canMove(left)) {
-                rc.move(left);
-            } else if (rc.canMove(right)) {
-                rc.move(right);
+            return;
+        }
+
+        // Direct direction blocked → try wall sliding
+        // If no slide direction set yet → pick perpendicular to current direction
+        if (wallSlideDir == null || !rc.canMove(wallSlideDir)) {
+            // Try rotating left twice (perpendicular)
+            Direction slideLeft = dir.rotateLeft().rotateLeft();
+            Direction slideRight = dir.rotateRight().rotateRight();
+            if (rc.canMove(slideLeft)) {
+                wallSlideDir = slideLeft;
+            } else if (rc.canMove(slideRight)) {
+                wallSlideDir = slideRight;
             } else {
+                // Both perpendiculars blocked → try all directions
                 for (Direction d : directions) {
                     if (rc.canMove(d)) {
-                        rc.move(d);
+                        wallSlideDir = d;
                         break;
                     }
                 }
             }
+        }
+
+        // Move in slide direction
+        if (wallSlideDir != null && rc.canMove(wallSlideDir)) {
+            rc.move(wallSlideDir);
         }
     }
 
@@ -666,6 +918,37 @@ public class RobotPlayer {
         Direction dir = directions[rng.nextInt(directions.length)];
         if (rc.canMove(dir)) {
             rc.move(dir);
+        }
+    }
+    // Report enemy tower location to our tower
+    static void reportEnemyTowerToTower(RobotController rc) throws GameActionException {
+        if (towerLocation == null) return;
+
+        // Save enemy tower location whenever visible, regardless of distance to tower
+        RobotInfo[] enemies = rc.senseNearbyRobots(-1, rc.getTeam().opponent());
+        for (RobotInfo enemy : enemies) {
+            if (enemy.getType() == UnitType.LEVEL_ONE_PAINT_TOWER ||
+                enemy.getType() == UnitType.LEVEL_TWO_PAINT_TOWER ||
+                enemy.getType() == UnitType.LEVEL_THREE_PAINT_TOWER ||
+                enemy.getType() == UnitType.LEVEL_ONE_MONEY_TOWER ||
+                enemy.getType() == UnitType.LEVEL_TWO_MONEY_TOWER ||
+                enemy.getType() == UnitType.LEVEL_THREE_MONEY_TOWER ||
+                enemy.getType() == UnitType.LEVEL_ONE_DEFENSE_TOWER ||
+                enemy.getType() == UnitType.LEVEL_TWO_DEFENSE_TOWER ||
+                enemy.getType() == UnitType.LEVEL_THREE_DEFENSE_TOWER) {
+                storedEnemyTowerToReport = enemy.getLocation();
+                break;
+            }
+        }
+
+        // Send stored enemy tower location only when near tower
+        if (storedEnemyTowerToReport != null &&
+            rc.getLocation().distanceSquaredTo(towerLocation) <= 20) {
+            int encoded = -(storedEnemyTowerToReport.x * 100 + storedEnemyTowerToReport.y);
+            if (rc.canSendMessage(towerLocation, encoded)) {
+                rc.sendMessage(towerLocation, encoded);
+                storedEnemyTowerToReport = null;
+            }
         }
     }
 }
