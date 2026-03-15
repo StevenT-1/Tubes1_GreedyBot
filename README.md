@@ -1,53 +1,72 @@
-# Battlecode 2025 Scaffold - Java
+# Authors
 
-This is the Battlecode 2025 Java scaffold, containing an `examplefuncsplayer`. Read https://play.battlecode.org/bc25java/quick_start !
+10122043 - Beni Lesmana
+13524060 - Steven Tan
+13524092 - Timothy Bernard Soeharto
 
+# Greedy Algorithm Overview
 
-### Project Structure
+Bot 1 uses an area-spreading strategy. Soldiers are assigned to different map quadrants based on their ID so that map coverage is distributed more evenly. Each unit then makes the best local decision available, such as painting the nearest valid tile, cleaning enemy paint, or spawning units depending on the current situation.
 
-- `README.md`
-    This file.
-- `build.gradle`
-    The Gradle build file used to build and run players.
-- `src/`
-    Player source code.
-- `test/`
-    Player test code.
-- `client/`
-    Contains the client. The proper executable can be found in this folder (don't move this!)
-- `build/`
-    Contains compiled player code and other artifacts of the build process. Can be safely ignored.
-- `matches/`
-    The output folder for match files.
-- `maps/`
-    The default folder for custom maps.
-- `gradlew`, `gradlew.bat`
-    The Unix (OS X/Linux) and Windows versions, respectively, of the Gradle wrapper. These are nifty scripts that you can execute in a terminal to run the Gradle build tasks of this project. If you aren't planning to do command line development, these can be safely ignored.
-- `gradle/`
-    Contains files used by the Gradle wrapper scripts. Can be safely ignored.
+Bot 2 uses a ruin-first strategy. Soldiers prioritize expanding through ruins first, then building SRPs, and finally controlling territory. This greedy approach focuses on expansion and economy, with an additional spacing rule to reduce conflicts when building SRPs.
 
-### How to get started
+Bot 3 uses a local greedy strategy with role-based priorities. Soldiers are divided into Builder and Attacker roles, and each role follows a different action priority order. This makes expansion, SRP construction, and enemy pressure more stable and consistent.
 
-You are free to directly edit `examplefuncsplayer`.
-However, we recommend you make a new bot by copying `examplefuncsplayer` to a new package under the `src` folder.
+# Battlecode 2025 Bot Project - Java
 
-### Useful Commands
+This repository contains three Java bots developed for Battlecode 2025, each implementing a different greedy strategy.
 
-- `./gradlew build`
-    Compiles your player
-- `./gradlew run`
-    Runs a game with the settings in gradle.properties
-- `./gradlew update`
-    Update configurations for the latest version -- run this often
-- `./gradlew zipForSubmit`
-    Create a submittable zip file
-- `./gradlew tasks`
-    See what else you can do!
+# Project Structure
 
+README.md
+Project documentation.
 
-### Configuration 
+build.gradle
+The Gradle build file used to build and run the bots.
 
-Look at `gradle.properties` for project-wide configuration.
+src/
+Bot source code.
 
-If you are having any problems with the default client, please report to teh devs and
-feel free to set the `compatibilityClient` configuration to `true` to download a different version of the client.
+test/
+Test code.
+
+client/
+Contains the Battlecode client executable.
+
+build/
+Contains compiled code and other build artifacts.
+
+matches/
+Output folder for match files.
+
+maps/
+Default folder for custom maps.
+
+gradlew, gradlew.bat
+Gradle wrapper scripts for Unix/macOS/Linux and Windows.
+
+gradle/
+Files used by the Gradle wrapper.
+
+# Getting Started
+
+You can develop and modify the bots directly inside the src/ folder.
+Each bot is implemented as a separate strategy variant for comparison and testing.
+
+# Useful Commands
+
+./gradlew build
+Compiles the project.
+
+./gradlew run
+Runs a match using the settings in gradle.properties.
+
+./gradlew zipForSubmit
+Creates a submission zip file.
+
+./gradlew tasks
+Lists all available Gradle tasks.
+
+# Configuration
+
+Project-wide configuration can be found in gradle.properties.
