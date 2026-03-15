@@ -60,7 +60,6 @@ public class RobotPlayer {
     // Ruin memory
     static MapLocation lastSeenEmptyRuin;
     static int lastSeenEmptyRuinRound = -9999;
-
     static class Candidate {
         final int type;
         final MapLocation loc;
@@ -105,7 +104,6 @@ public class RobotPlayer {
             }
         }
     }
-
     static void initialise(RobotController rc) throws GameActionException {
         if (initialised)
             return;
