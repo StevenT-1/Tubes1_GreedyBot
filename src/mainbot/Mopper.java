@@ -1,4 +1,4 @@
-package greedybot;
+package mainbot;
 
 import battlecode.common.*;
 

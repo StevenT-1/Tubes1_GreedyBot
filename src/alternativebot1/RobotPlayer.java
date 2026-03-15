@@ -1,4 +1,4 @@
-package benibot;
+package alternativebot1;
 
 import battlecode.common.*;
 import java.util.Random;
